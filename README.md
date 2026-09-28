@@ -32,14 +32,16 @@ app/
   delivery.py    投递状态报告解析（RFC 3464 DSN / RFC 6522 multipart/report，纯只读）
   routingaudit.py 投递路径时钟审计（Received 头自底向上重建 hop、时间倒退/主机回环/坏头诊断，纯只读）
   threading.py   会话关联构建（Message-ID/References 回复图、断链、拓扑排序，纯只读）
+  calendar.py    日历事件汇总（text/calendar 单次 VEVENT 解析、TZID 折 UTC、夏令时诊断、跨邮件版本选择，纯只读）
   compare.py     两封邮件 MIME 树递归对齐比较（内容指纹配对、重排识别、歧义标记，纯只读）
   archive.py     整邮件附件 ZIP 打包（确定性条目/压缩、名称冲突改名、manifest.json，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     请求/响应模型
-tests/           359 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+tests/           416 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  整邮件 ZIP、cid 引用审计、展示正文选择、安全策略评估、
-                 DSN 投递状态、投递路径时钟审计、会话关联、MIME 树比较、HTTP 端到端）
+                 DSN 投递状态、投递路径时钟审计、会话关联、日历事件汇总、
+                 MIME 树比较、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -51,8 +53,10 @@ requirements.txt
 docker compose up --build
 ```
 
-服务监听 **8000** 端口，SQLite 数据文件位于容器内 `/data/mime.db`
-（compose 中以命名卷 `mime-data` 持久化）。启动时自动建库建表。
+一条命令完成构建与启动；服务监听 **http://localhost:8000**
+（容器内监听 8000，compose 已映射到宿主机同名端口），SQLite 数据文件
+位于容器内 `/data/mime.db`（命名卷 `mime-data` 持久化）。启动时自动
+建库建表，无需任何额外初始化。
 
 健康检查：
 
@@ -60,6 +64,9 @@ docker compose up --build
 curl http://localhost:8000/health
 # {"status":"ok","database":"/data/mime.db"}
 ```
+
+接口根地址：**http://localhost:8000**（交互文档
+http://localhost:8000/docs ）。
 
 ## 本地运行（不用 Docker）
 
@@ -115,6 +122,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
 | GET | `/messages/{id}/attachments.zip` | **整邮件附件 ZIP**：文档序逐 blob 出现打包 + 内置 manifest（见下） |
 | POST | `/messages/compare` | 只读比较两封已归档邮件的 MIME 树（见下） |
+| GET | `/calendar/events` | **跨全部归档邮件**汇总 `text/calendar` 单次 VEVENT（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
 
@@ -894,6 +902,97 @@ mixed 邮件，第二叶子文本由 `two` 变为 `TWO!`，且一侧多了附件
 | **404** | 任一 id 在归档中不存在（`detail` 指明具体 id） |
 | **422** | 请求体不合规：缺字段、字段非整数、id 小于 1 |
 
+## 日历事件汇总（iCalendar / RFC 5545）
+
+```bash
+curl http://localhost:8000/calendar/events
+```
+
+在**全部归档邮件**的 `text/calendar` 文本叶子（含
+`message/rfc822` / `message/global` 封装报文内部）上做**只读、确定性**
+的日历事件汇总：只读取归档时保存的节点文本，不写入、不修改任何记录，
+对历史归档数据同样有效；同一归档库重复请求结果逐字节稳定。
+
+**解析规则**：
+
+- 先按 RFC 5545 §3.1 **展开折叠行**（归档文本换行已统一为 `\n`；
+  续行以 SP/HT 开头，展开时删除换行及续行的首个空白字符，其余空白
+  保留），再遍历组件：`BEGIN:VCALENDAR` 内的 `METHOD`（值大写化，
+  典型为 `REQUEST` / `CANCEL`；在 VCALENDAR 中的位置宽容）作为其
+  范围内 VEVENT 的方法，`VTIMEZONE` 等非 VEVENT 组件整体跳过；
+- 每个 **VEVENT** 读取 `UID`、`SEQUENCE`（缺省 `0`，须为非负整数）、
+  `DTSTAMP`、`DTSTART`、`DTEND`、`SUMMARY`（TEXT 值按 RFC 5545
+  §3.3.11 反转义）；重复属性宽容取首次；本接口只抽取单次事件，
+  `RRULE` 等重复规则不影响字段读取；
+- 每个事件**必须有** `UID`、`DTSTAMP`、`DTSTART`、`DTEND`；
+- 时间只接受两种形式：**UTC**（`Z` 后缀）或带 **IANA `TZID`** 的
+  DATE-TIME（`Asia/Shanghai`、`America/New_York` 等，经 `zoneinfo` +
+  随镜像打包的 `tzdata` 折算 UTC）。DATE 值（`VALUE=DATE`）、浮动
+  时间（无 Z 无 TZID）、`Z` 与 `TZID` 同写、无法解析的 TZID、
+  不存在的日历日期均为无效时间；
+- **夏令时诊断**：带 TZID 的本地时间若落在春季跳时空隙
+  （如 `America/New_York` 2026-03-08 02:30）→ 不存在；落在秋季
+  回拨重复区间（如 2026-11-01 01:30）→ 有歧义——两种情况逐项诊断，
+  不猜测偏移；
+- **同一节点内重复 UID** 的每个事件逐项诊断（含 `vevent_index`、
+  `uid`、`count`），全部不入选；不同节点 / 不同邮件的同 UID 合法
+  事件进入版本选择，不算重复。
+
+**跨邮件版本选择**：同一 UID 的合法事件依次按
+（`SEQUENCE` 降序 → `DTSTAMP` 降序 → `message_id` 降序 →
+`node_path` 文档序降序）选出**当前版本**；胜出版本的 `METHOD` 为
+`CANCEL` 时 `status="cancelled"`（其余 `confirmed`），并在
+`source` 中保留其归档来源（`message_id` / `node_path`）。结果按
+**UTC 起始时间、UID** 稳定排序。
+
+响应中的每条 `diagnostics` 都带 `message_id` 与 `node_path`
+（根节点为 `""`），被诊断的事件不会出现在 `events` 中：
+
+```json
+{
+  "events": [
+    {
+      "uid": "team-sync@example.com",
+      "sequence": 2,
+      "method": "REQUEST",
+      "status": "confirmed",
+      "dtstamp": "2026-09-20T12:00:00Z",
+      "dtstart": "2026-09-28T14:00:00Z",
+      "dtend": "2026-09-28T15:00:00Z",
+      "summary": "Team sync",
+      "source": {"message_id": 3, "node_path": "2"}
+    }
+  ],
+  "diagnostics": [
+    {
+      "message_id": 2,
+      "node_path": "1",
+      "code": "CALENDAR_TIME_NONEXISTENT",
+      "detail": {
+        "vevent_index": 0,
+        "field": "DTSTART",
+        "value": "20260308T023000"
+      }
+    }
+  ]
+}
+```
+
+诊断码：
+
+| `code` | 触发条件 |
+| ---- | ---- |
+| `MISSING_CALENDAR_FIELD` | 缺 `UID` / `DTSTAMP` / `DTSTART` / `DTEND`（`detail.field`） |
+| `INVALID_CALENDAR_TIME` | 时间值无法解析：DATE 值、浮动时间、Z+TZID、未知 TZID、非法日期（`detail.field` / `detail.value`） |
+| `CALENDAR_TIME_NONEXISTENT` | TZID 本地时间落入春季夏令时跳时空隙（墙钟不存在） |
+| `CALENDAR_TIME_AMBIGUOUS` | TZID 本地时间落入秋季夏令时回拨重复区间（两种 UTC 偏移） |
+| `INVALID_CALENDAR_SEQUENCE` | `SEQUENCE` 不是非负整数（`detail.value`） |
+| `DUPLICATE_CALENDAR_UID` | 同一 `text/calendar` 节点内多个 VEVENT 使用同一 UID（逐项给出，`detail.vevent_index` / `uid` / `count`） |
+
+空归档（或没有任何日历节点）返回
+`{"events": [], "diagnostics": []}`，状态码始终为 **200**——解析问题
+全部体现在诊断列表中，不影响接口可用性。
+
 ## 内容寻址附件库
 
 归档时，所有**非文本叶子**（`kind == "blob"`，含整封邮件本身就是二进制、
@@ -993,6 +1092,12 @@ curl -H 'Range: bytes=-50'   http://localhost:8000/attachments/c1e372ae…/conte
 | `AMBIGUOUS_RELATED_START` / `RELATED_START_NOT_FOUND` | `display-body` 查询时 multipart/related 的 `start` 重复命中或未命中（查询期错误，不改写记录） |
 | `MULTIPLE_DELIVERY_STATUS` / `DELIVERY_STATUS_NOT_FOUND` / `DELIVERY_STATUS_UNREADABLE` / `INVALID_DELIVERY_STATUS` / `MISSING_DELIVERY_FIELD` / `INVALID_DELIVERY_FIELD` | `delivery-report` 查询时 DSN 作用域结构或 `message/delivery-status` 字段非法（查询期错误，不改写记录） |
 | `ATTACHMENT_BYTES_UNAVAILABLE` | `attachments.zip` 打包时 blob 节点的解码字节在附件库中缺失（邮件归档于附件字节留存升级之前），`node_path` 定位该节点 |
+
+`/calendar/events` 的日历问题**不是错误响应**：接口始终返回 200，
+`MISSING_CALENDAR_FIELD` / `INVALID_CALENDAR_TIME` /
+`CALENDAR_TIME_NONEXISTENT` / `CALENDAR_TIME_AMBIGUOUS` /
+`INVALID_CALENDAR_SEQUENCE` / `DUPLICATE_CALENDAR_UID` 逐项放在响应体
+的 `diagnostics` 中（见上文“日历事件汇总”）。
 
 ## 指纹规范化规则
 

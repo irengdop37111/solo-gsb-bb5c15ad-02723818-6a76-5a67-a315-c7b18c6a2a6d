@@ -409,6 +409,46 @@ class RoutingAuditResponse(BaseModel):
     first_anomaly: Optional[RoutingFirstAnomaly] = None
 
 
+# ---------------------------------------------------------------------------
+# 日历事件汇总（GET /calendar/events，RFC 5545 iCalendar）
+# ---------------------------------------------------------------------------
+
+
+class CalendarEventSource(BaseModel):
+    """事件当前版本的归档来源（CANCEL 取消也保留来源）。"""
+
+    message_id: int
+    node_path: str
+
+
+class CalendarEvent(BaseModel):
+    """跨邮件按 SEQUENCE / DTSTAMP 选出的单个事件当前版本。"""
+
+    uid: str
+    sequence: int  # 缺省 0
+    method: Optional[str] = None  # 大写日历 METHOD：REQUEST / CANCEL 等；无则 null
+    status: str  # confirmed | cancelled（METHOD:CANCEL）
+    dtstamp: str  # UTC ISO 8601（Z）
+    dtstart: str  # UTC ISO 8601（Z）
+    dtend: str  # UTC ISO 8601（Z）
+    summary: Optional[str] = None
+    source: CalendarEventSource
+
+
+class CalendarDiagnostic(BaseModel):
+    """逐项诊断：无效时间、夏令时歧义、缺字段或节点内重复 UID。"""
+
+    message_id: int
+    node_path: str
+    code: str
+    detail: dict = {}
+
+
+class CalendarEventsResponse(BaseModel):
+    events: list[CalendarEvent]  # 按 (UTC 起始时间, UID) 稳定排序
+    diagnostics: list[CalendarDiagnostic]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

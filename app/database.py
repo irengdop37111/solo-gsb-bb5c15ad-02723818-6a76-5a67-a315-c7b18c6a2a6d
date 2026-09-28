@@ -403,6 +403,29 @@ def list_thread_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     )
 
 
+def list_calendar_nodes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """全部归档邮件中的 ``text/calendar`` 文本叶子（含封装报文内部）。
+
+    供 ``GET /calendar/events`` 做全库只读汇总。按归档 id 与节点
+    id（即邮件内 MIME 文档序）升序返回；调用方还需按
+    ``(message_id, path)`` 聚合后自行按物化路径排文档序。
+    """
+
+    return list(
+        conn.execute(
+            """
+            SELECT n.message_id AS message_id, n.path AS path,
+                   n.content_type AS content_type, n.kind AS kind,
+                   n.text_content AS text_content
+            FROM nodes n
+            WHERE n.kind = 'text'
+              AND lower(n.content_type) = 'text/calendar'
+            ORDER BY n.message_id, n.id
+            """
+        ).fetchall()
+    )
+
+
 # ---------------------------------------------------------------------------
 # 附件库查询
 # ---------------------------------------------------------------------------

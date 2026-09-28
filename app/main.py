@@ -21,6 +21,7 @@ from .archive import (
     build_attachments_zip,
     entries_from_rows,
 )
+from .calendar import _format_utc, collect_calendar_events
 from .compare import compare_messages
 from .delivery import extract_delivery_reports
 from .displaybody import select_display_body
@@ -33,6 +34,10 @@ from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    CalendarDiagnostic,
+    CalendarEvent,
+    CalendarEventSource,
+    CalendarEventsResponse,
     CompareDiff,
     CompareFacetChange,
     CompareRef,
@@ -131,8 +136,15 @@ app = FastAPI(
         "重建投递 hop（主机、协议、带原始时区的时间与原始顺序），检测"
         "相邻 hop 时间倒退、重复主机回环与无法解析的头，坏头不改写归档"
         "数据而列入诊断，返回稳定的 anomaly 详情与首个异常位置。"
+        "GET /calendar/events 跨全部归档邮件只读汇总 text/calendar 叶子"
+        "中的单次 VEVENT：展开 RFC 5545 折叠行，读取 METHOD（REQUEST/"
+        "CANCEL）与 UID/SEQUENCE（缺省 0）/DTSTAMP/DTSTART/DTEND/"
+        "SUMMARY，UTC 与 IANA TZID 时间折算 UTC，无效及夏令时不存在/"
+        "歧义时间、同一节点重复 UID 逐项诊断（带 message_id/node_path），"
+        "跨邮件同 UID 按 SEQUENCE/DTSTAMP/message_id 选当前版本，CANCEL "
+        "标为已取消并保留来源，按起始时间与 UID 稳定排序。"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -182,6 +194,63 @@ def _message_404(message_id: int) -> HTTPException:
 @app.get("/health")
 def health(request: Request) -> dict:
     return {"status": "ok", "database": request.app.state.db_path}
+
+
+@app.get("/calendar/events", response_model=CalendarEventsResponse)
+def get_calendar_events(
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> CalendarEventsResponse:
+    """汇总全部归档邮件 ``text/calendar`` 节点中的单次 VEVENT（纯只读）。
+
+    扫描所有归档邮件（含 ``message/rfc822`` / ``message/global`` 封装
+    报文内部）的 ``text/calendar`` 文本叶子：先按 RFC 5545 §3.1 展开
+    折叠行，读取日历 ``METHOD``（``REQUEST`` / ``CANCEL`` 等，大写）
+    与每个事件的 ``UID``、``SEQUENCE``（缺省 0）、``DTSTAMP``、
+    ``DTSTART``、``DTEND``、``SUMMARY``。
+
+    每个事件必须有 UID / DTSTAMP / DTSTART / DTEND；UTC（``Z``）或
+    IANA ``TZID`` 的起止时间折算 UTC；无效时间（含 DATE 值、浮动
+    时间、无法解析的 TZID）以及夏令时转换中**不存在**（春季跳时）或
+    **有歧义**（秋季回拨）的本地时间、非法 SEQUENCE、**同一节点内
+    重复 UID** 逐项列入 ``diagnostics``（带 ``message_id`` /
+    ``node_path``），对应事件不参与版本合并。
+
+    跨邮件同一 UID 依次按（``SEQUENCE`` 降序、``DTSTAMP`` 降序、
+    ``message_id`` 降序、节点文档序）取当前版本；``METHOD:CANCEL``
+    的胜出版本标记 ``status=cancelled`` 且保留 ``source`` 来源。
+    事件按 UTC 起始时间、UID 稳定排序。
+    """
+
+    rows = database.list_calendar_nodes(conn)
+    events, diagnostics = collect_calendar_events(rows)
+    return CalendarEventsResponse(
+        events=[
+            CalendarEvent(
+                uid=event.uid,
+                sequence=event.sequence,
+                method=event.method,
+                status=event.status,
+                dtstamp=_format_utc(event.dtstamp),
+                dtstart=_format_utc(event.dtstart),
+                dtend=_format_utc(event.dtend),
+                summary=event.summary,
+                source=CalendarEventSource(
+                    message_id=event.source.message_id,
+                    node_path=event.source.node_path,
+                ),
+            )
+            for event in events
+        ],
+        diagnostics=[
+            CalendarDiagnostic(
+                message_id=diagnostic.message_id,
+                node_path=diagnostic.node_path,
+                code=diagnostic.code,
+                detail=diagnostic.detail,
+            )
+            for diagnostic in diagnostics
+        ],
+    )
 
 
 @app.post("/messages", status_code=201, response_model=MessageCreated)
