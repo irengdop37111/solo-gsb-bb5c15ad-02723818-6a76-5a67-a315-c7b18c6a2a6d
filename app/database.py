@@ -403,6 +403,27 @@ def list_thread_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     )
 
 
+def list_calendar_nodes(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """全部归档邮件中的 ``text/calendar`` 文本叶子（含封装报文内部）。
+
+    纯只读查询：归档解析保证 text/calendar 叶子为 ``kind='text'``、
+    解码文本存于 ``text_content``。按 ``(message_id, 节点 id)`` 升序，
+    节点 id 即邮件内 MIME 文档序，供 :mod:`app.calendarparse` 在全量
+    归档上聚合事件。
+    """
+
+    return list(
+        conn.execute(
+            """
+            SELECT message_id, path, content_type, text_content
+            FROM nodes
+            WHERE kind = 'text' AND lower(content_type) = 'text/calendar'
+            ORDER BY message_id, id
+            """
+        ).fetchall()
+    )
+
+
 # ---------------------------------------------------------------------------
 # 附件库查询
 # ---------------------------------------------------------------------------

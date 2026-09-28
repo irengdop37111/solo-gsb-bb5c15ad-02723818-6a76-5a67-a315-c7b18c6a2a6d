@@ -31,15 +31,17 @@ app/
   security.py    附件安全策略评估（双扩展/控制字符/禁止类型/嵌套/阈值，纯只读）
   delivery.py    投递状态报告解析（RFC 3464 DSN / RFC 6522 multipart/report，纯只读）
   routingaudit.py 投递路径时钟审计（Received 头自底向上重建 hop、时间倒退/主机回环/坏头诊断，纯只读）
+  calendarparse.py 日历事件聚合（text/calendar 单次 VEVENT、IANA 时区转 UTC、跨邮件版本选择，纯只读）
   threading.py   会话关联构建（Message-ID/References 回复图、断链、拓扑排序，纯只读）
   compare.py     两封邮件 MIME 树递归对齐比较（内容指纹配对、重排识别、歧义标记，纯只读）
   archive.py     整邮件附件 ZIP 打包（确定性条目/压缩、名称冲突改名、manifest.json，纯只读）
   database.py    SQLite 建表、事务化写入、消息/节点/附件查询
   errors.py      定位到节点的解析错误
   schemas.py     请求/响应模型
-tests/           359 个 pytest 用例（指纹稳定性、损坏输入、附件库、
+tests/           414 个 pytest 用例（指纹稳定性、损坏输入、附件库、
                  整邮件 ZIP、cid 引用审计、展示正文选择、安全策略评估、
-                 DSN 投递状态、投递路径时钟审计、会话关联、MIME 树比较、HTTP 端到端）
+                 DSN 投递状态、投递路径时钟审计、日历事件聚合、会话关联、
+                 MIME 树比较、HTTP 端到端）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -114,6 +116,7 @@ curl -X POST http://localhost:8000/messages \
 | GET | `/messages/{id}/routing-audit` | 从 `Received` 头重建投递路径并审计时钟倒退/回环/坏头（见下） |
 | GET | `/messages/{id}/thread` | 会话关联查询：回复图、断链与拓扑排序（见下） |
 | GET | `/messages/{id}/attachments.zip` | **整邮件附件 ZIP**：文档序逐 blob 出现打包 + 内置 manifest（见下） |
+| GET | `/calendar/events` | 聚合全部归档邮件 `text/calendar` 中的单次 VEVENT（见下） |
 | POST | `/messages/compare` | 只读比较两封已归档邮件的 MIME 树（见下） |
 | GET | `/attachments` | 附件库列表（分页 + `sha256`/`filename`/`media_type` 过滤） |
 | GET | `/attachments/{sha256}/content` | 下载附件原始解码字节（支持单段 `bytes` Range） |
@@ -682,6 +685,104 @@ curl http://localhost:8000/messages/2/thread
 `null`）、原始与规范化主题、解析后的 `date`（非法/缺失时 `null`）、
 `parent_id` 与回复深度 `depth`（根为 0）；`edges` 是父子边
 （`parent_id` 是 `child_id` 的直接父件）。邮件不存在返回 **404**。
+
+## 日历事件聚合（iCalendar）
+
+```bash
+curl http://localhost:8000/calendar/events
+```
+
+跨**全部归档邮件**的只读聚合：遍历每封邮件 MIME 树（含
+`message/rfc822` / `message/global` 封装报文内部）的所有
+`text/calendar` 文本叶子，按 [RFC 5545 (iCalendar)](https://www.rfc-editor.org/rfc/rfc5545)
+解析其中的**单次 `VEVENT`**（不展开重复会议）。只读取归档时解码
+保存的节点文本，**不回写任何记录**；空归档库返回
+`{"events": [], "diagnostics": []}`。
+
+**解析规则**：
+
+- **折叠行展开**：物理行以 `CRLF`/`LF`/`CR` 后紧跟空格或制表符为
+  折叠点，按 RFC 5545 §3.1 删除行终止符及其后**恰好一个** WSP；
+  块首出现折叠续行、`VCALENDAR`/`VEVENT` 结构损坏（无 `VCALENDAR`
+  外壳、嵌套 `VEVENT`、未闭合组件、`END` 不匹配、内容行语法损坏、
+  `METHOD` 重复）列入 `diagnostics`，坏事件不影响同节点其他事件；
+- 读取日历 **`METHOD`**（仅取直接处于 `VCALENDAR` 内的 `METHOD`，
+  规范化为大写，如 `REQUEST` / `CANCEL`；缺失为 `null`，不诊断）与
+  每个 `VEVENT` 的 **`UID`、`SEQUENCE`（缺省 0，必须是非负整数）、
+  `DTSTAMP`、`DTSTART`、`DTEND`、`SUMMARY`**；`SUMMARY` 按
+  RFC 5545 §3.3.11 反转义（`\n`、`\,`、`\;`、`\\`）；`VTIMEZONE`
+  与 `VALARM` 内部内容不参与事件提取；单值属性重复出现判事件无效；
+- 每个事件**必须具备**非空 `UID`、`DTSTAMP`、`DTSTART`、`DTEND`，
+  缺失逐项给出 `MISSING_EVENT_FIELD`（一次列全缺失字段）；
+- **时间只接受 UTC 与 IANA 时区**：
+  - `...Z` 形式按 UTC 处理；
+  - 带 `TZID=<IANA 名称>` 的本地时间按 IANA 时区数据库（镜像内置
+    `tzdata` 包，容器内也可解析）转换为 UTC，时区参数允许引号包裹；
+  - **浮动时间**（无 `Z` 也无 `TZID`）、**纯日期**（`VALUE=DATE`）、
+    **未知/非 IANA TZID**、`Z` 与 `TZID` 同时给出、语法/日历日期
+    非法，逐项诊断；
+  - 落入夏令时**间隙**（春季跳时中不存在的墙上时间，`dst_gap`）或
+    **重叠歧义**（秋季回拨时同一墙上时间发生两次，`dst_ambiguous`）
+    的本地时间同样逐项诊断——两种表述都无法唯一确定 UTC 时刻；
+- **同一节点内重复 `UID`**：该 UID 的每个 `VEVENT` 逐项诊断
+  （`DUPLICATE_UID_IN_NODE`，附 `event_index` 与出现次数），且它们
+  都不参与版本选择；不同邮件/不同节点的同 UID 是正常的会议更新，
+  不在此列。
+
+**跨邮件版本选择**：有效事件按 `UID` 分组，依次比较
+`SEQUENCE`（大者胜）→ `DTSTAMP`（晚者胜）→ `message_id`（归档
+后者胜，确定性兜底）选出**当前版本**。当选版本的 `METHOD` 为
+`CANCEL` 时 `cancelled: true`（事件仍保留在结果中，并完整保留来源
+`message_id` / `node_path`）；其余 `METHOD`（含缺失）不标记取消。
+最终事件按 **`(dtstart, uid)` 稳定排序**，所有时间以
+`YYYY-MM-DDTHH:MM:SSZ`（UTC）输出。
+
+响应示例（初始邀请 + 一次更新 + 一次取消，外加一封含坏时间的邮件）：
+
+```json
+{
+  "events": [
+    {
+      "uid": "standup@example.com",
+      "sequence": 3,
+      "method": "CANCEL",
+      "cancelled": true,
+      "dtstamp": "2026-09-25T07:30:00Z",
+      "dtstart": "2026-10-01T09:00:00Z",
+      "dtend": "2026-10-01T10:00:00Z",
+      "summary": "Team standup",
+      "message_id": 3,
+      "node_path": "2"
+    }
+  ],
+  "diagnostics": [
+    {
+      "code": "INVALID_EVENT_TIME",
+      "message_id": 4,
+      "node_path": "2",
+      "detail": {
+        "reason": "dst_ambiguous",
+        "field": "DTSTART",
+        "value": "20261101T013000",
+        "tzid": "America/New_York"
+      }
+    }
+  ]
+}
+```
+
+诊断始终返回 **200**（本接口没有 4xx 错误路径——坏数据被隔离到
+`diagnostics` 而非拒收整个请求），每条诊断都附其归档定位
+`message_id` 与 `node_path`：
+
+| 诊断 `code` | 触发条件（`detail.reason`） |
+| ---- | ---- |
+| `CALENDAR_MALFORMED` | 空正文（`empty_body`）、块首折叠（`fold_without_previous_line`）、无 `VCALENDAR`（`no_vcalendar`）、嵌套 `VEVENT`（`nested_vevent`）、未闭合组件（`unclosed_component`）、`END` 不匹配（`end_without_matching_begin`）、`METHOD` 重复（`duplicate_method`） |
+| `CALENDAR_INVALID_LINE` | 内容行无法解析（无冒号/属性名非法/参数损坏/参数重复），`detail.line` 给出原始行 |
+| `MISSING_EVENT_FIELD` | 事件缺非空 `UID`/`DTSTAMP`/`DTSTART`/`DTEND`，`detail.fields` 一次列全 |
+| `INVALID_EVENT_FIELD` | `SEQUENCE` 非非负整数（`sequence_not_integer`）或单值属性重复（`duplicate_property`） |
+| `INVALID_EVENT_TIME` | `not_iso`/`not_a_datetime`、`floating_time`、`date_not_datetime`、`unknown_tzid`、`utc_with_tzid`、`dst_gap`、`dst_ambiguous`，均附 `field`（`DTSTART`/`DTEND`/`DTSTAMP`）与 `value` |
+| `DUPLICATE_UID_IN_NODE` | 同一 text/calendar 节点内多个 `VEVENT` 同 UID，附 `uid`、`event_index`、`occurrences` |
 
 ## 整邮件附件 ZIP
 

@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -21,6 +22,7 @@ from .archive import (
     build_attachments_zip,
     entries_from_rows,
 )
+from .calendarparse import extract_calendar_events
 from .compare import compare_messages
 from .delivery import extract_delivery_reports
 from .displaybody import select_display_body
@@ -33,6 +35,9 @@ from .schemas import (
     AttachmentListResponse,
     AttachmentOccurrence,
     AttachmentSummary,
+    CalendarDiagnostic,
+    CalendarEventItem,
+    CalendarEventsResponse,
     CompareDiff,
     CompareFacetChange,
     CompareRef,
@@ -131,8 +136,14 @@ app = FastAPI(
         "重建投递 hop（主机、协议、带原始时区的时间与原始顺序），检测"
         "相邻 hop 时间倒退、重复主机回环与无法解析的头，坏头不改写归档"
         "数据而列入诊断，返回稳定的 anomaly 详情与首个异常位置。"
+        "GET /calendar/events 在全部归档邮件的 text/calendar 叶子上只读"
+        "解析单次 VEVENT（RFC 5545，展开折叠行）：读取 METHOD 与 UID、"
+        "SEQUENCE、DTSTAMP/DTSTART/DTEND/SUMMARY，UTC 或 IANA TZID 时间"
+        "统一转 UTC，无效/夏令时歧义时间与同节点重复 UID 逐项诊断；跨邮件"
+        "同 UID 按 SEQUENCE→DTSTAMP→message_id 选当前版本，CANCEL 标记"
+        "已取消并保留来源，结果按起始时间与 UID 稳定排序，不回写任何记录。"
     ),
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -961,6 +972,69 @@ def _etag_matches(header: str, etag: str) -> bool:
         if token == f'"{etag}"' or token == f'W/"{etag}"':
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# 日历事件聚合（iCalendar / RFC 5545）
+# ---------------------------------------------------------------------------
+
+
+def _utc_iso(dt: datetime) -> str:
+    """朴素 UTC datetime → RFC 5545/ISO 8601 形式的 ``...Z`` 字符串。"""
+
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@app.get("/calendar/events", response_model=CalendarEventsResponse)
+def get_calendar_events(
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> CalendarEventsResponse:
+    """聚合全部归档邮件 ``text/calendar`` 节点中的单次 VEVENT（纯只读）。
+
+    遍历所有已归档邮件（含 ``message/rfc822`` / ``message/global``
+    封装报文内部）的 ``text/calendar`` 叶子，按 RFC 5545 展开折叠行后
+    读取日历 ``METHOD`` 与每个 ``VEVENT`` 的 ``UID``、``SEQUENCE``
+    （缺省 0）、``DTSTAMP``、``DTSTART``、``DTEND``、``SUMMARY``：
+
+    * 每个事件必须具备 UID、DTSTAMP、DTSTART、DTEND；时间仅接受 UTC
+      （``Z``）或 IANA ``TZID`` 形式并统一转换为 UTC；浮动时间、纯
+      日期、未知 TZID、夏令时**间隙/重叠歧义**逐项诊断；
+    * 同一节点内重复 UID 的每个出现逐项诊断且不参与版本选择；
+    * 跨邮件同 UID 依次按 ``SEQUENCE`` → ``DTSTAMP`` → ``message_id``
+      选出当前版本，``METHOD:CANCEL`` 的当选事件 ``cancelled=true``
+      并保留来源；
+    * 事件按 ``(dtstart, uid)`` 稳定排序。任何坏数据都不影响其他
+      事件，统一在 ``diagnostics`` 中附 ``message_id`` / ``node_path``。
+    """
+
+    rows = database.list_calendar_nodes(conn)
+    events, diagnostics = extract_calendar_events(rows)
+    return CalendarEventsResponse(
+        events=[
+            CalendarEventItem(
+                uid=e.uid,
+                sequence=e.sequence,
+                method=e.method,
+                cancelled=e.cancelled,
+                dtstamp=_utc_iso(e.dtstamp),
+                dtstart=_utc_iso(e.dtstart),
+                dtend=_utc_iso(e.dtend),
+                summary=e.summary,
+                message_id=e.message_id,
+                node_path=e.node_path,
+            )
+            for e in events
+        ],
+        diagnostics=[
+            CalendarDiagnostic(
+                code=d.code,
+                message_id=d.message_id,
+                node_path=d.node_path,
+                detail=d.detail,
+            )
+            for d in diagnostics
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------

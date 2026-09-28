@@ -418,3 +418,37 @@ class ErrorBody(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+
+
+# ---------------------------------------------------------------------------
+# 日历事件聚合（GET /calendar/events，iCalendar / RFC 5545）
+# ---------------------------------------------------------------------------
+
+
+class CalendarEventItem(BaseModel):
+    """跨邮件版本选择后的当前版本单次 VEVENT（时间均已转为 UTC）。"""
+
+    uid: str
+    sequence: int  # 缺省 0
+    method: Optional[str] = None  # 日历 METHOD 大写值（REQUEST/CANCEL/…），无则 None
+    cancelled: bool  # METHOD:CANCEL 的当选事件为 true
+    dtstamp: str  # ISO 8601 UTC，如 2026-09-28T08:30:00Z
+    dtstart: str
+    dtend: str
+    summary: Optional[str] = None
+    message_id: int  # 当选版本来源邮件
+    node_path: str  # 当选版本来源 text/calendar 节点
+
+
+class CalendarDiagnostic(BaseModel):
+    """一条逐项诊断：无效时间/缺字段/坏结构/同节点重复 UID 等。"""
+
+    code: str
+    message_id: int
+    node_path: str
+    detail: dict
+
+
+class CalendarEventsResponse(BaseModel):
+    events: list[CalendarEventItem]  # 按 (dtstart, uid) 稳定排序
+    diagnostics: list[CalendarDiagnostic]
